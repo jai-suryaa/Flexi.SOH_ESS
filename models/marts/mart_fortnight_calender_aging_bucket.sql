@@ -1,6 +1,6 @@
 {{ config(
     materialized='incremental',
-    unique_key=['device_id', 'cell_no', 'soc_bucket', 'temp_bucket'],
+    unique_key=['device_id', 'cell_no', 'soc_bucket', 'temp_bucket', 'season_year'],
     tags=['experimental', 'SOH']
 ) }}
 
@@ -37,29 +37,31 @@ idle_with_duration AS (
 aggregated AS (
     SELECT
         device_id,
-        cell_no,
-        soc_bucket,
         temp_bucket,
-        AVG(soc)                        AS avg_soc,
-        AVG(temp_c)                     AS avg_temp,
+        soc_bucket,
+        cell_no,
+        year,
+        season,
+        season_year,
+        AVG(soc)  AS avg_soc,
+        AVG(temp_c)  AS avg_temp,
         SUM(duration_seconds) / 3600.0  AS total_rest_hours
     FROM idle_with_duration
-    GROUP BY
-        device_id,
-        cell_no,
-        soc_bucket,
-        temp_bucket
+    GROUP BY 1, 2, 3, 4, 5, 6, 7
 )
 
 SELECT
     device_id,
-    cell_no,
-    soc_bucket,
     temp_bucket,
+    soc_bucket,
+    cell_no,
+    year,
+    season,
+    season_year,
     avg_soc,
     avg_temp,
     total_rest_hours,
-    CAST(NULL AS DOUBLE)                AS q_loss,
+    CAST(NULL AS DOUBLE) AS q_loss,
     '{{ var("process_date") }}'::date   AS ts
 FROM aggregated
-ORDER BY device_id, cell_no, soc_bucket
+ORDER BY 1, 2, 3, 4, 7

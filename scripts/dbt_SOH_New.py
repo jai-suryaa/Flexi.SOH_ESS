@@ -9,18 +9,50 @@ import os
 import traceback
 from scipy.optimize import curve_fit
 
-NUM_DAYS = 15
 DBT_PROJECT_DIR = "C:/EOL/SOH/Flexi.SOH_ESS"
 DB_FILE = "dev.duckdb"
 
-SOC_START_THRESHOLD = 30.0
-SOC_END_THRESHOLD   = 99.0
-MIN_CHARGE_CURRENT  = 5.0
+SEASONS = {
+    "summer": [3, 4, 5, 6],
+    "rainy": [7, 8, 9, 10],
+    "winter": [11, 12, 1, 2]
+}
 
-IMBALANCE_TABLE_MV = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110]
-IMBALANCE_TABLE_AH = [0, 0.18, 0.32, 0.46, 0.56, 0.66, 0.80, 1.02, 1.34, 1.84, 2.60, 3.68]
-VREF_IMBALANCE     = 3.58
-SOH_INITIAL        = 1.0
+def get_season_from_date(date):
+    month = date.month
+    year = date.year
+    
+    if month in [3, 4, 5, 6]:
+        return "summer", year
+    elif month in [7, 8, 9, 10]:
+        return "rainy", year
+    elif month in [11, 12]:
+        return "winter", year
+    elif month in [1, 2]:
+        return "winter", year - 1
+    
+    raise ValueError(f"Invalid month: {month}")
+
+
+def get_seasons_in_range(start_date, end_date):
+    seasons_list = []
+    current = start_date
+    
+    while current <= end_date:
+        season, year = get_season_from_date(current)
+        season_start, season_end = get_season_date_range(season, year)
+        
+        actual_start = max(season_start, start_date)
+        actual_end = min(season_end, end_date)
+        
+        season_year = f"{season}_{year}"
+        
+        if not seasons_list or seasons_list[-1][2] != season_year:
+            seasons_list.append((season, year, season_year, actual_start, actual_end))
+        
+        current = season_end + timedelta(days=1)
+    
+    return seasons_list
 
 
 def parse_args():
@@ -30,20 +62,44 @@ def parse_args():
 
     if args:
         try:
-            return datetime.strptime(args[0], "%Y-%m-%d"), do_refit
+            start_date = datetime.strptime(args[0], "%Y-%m-%d")
+            return start_date, do_refit
         except ValueError:
             print("Invalid date format. Use YYYY-MM-DD.")
             exit(1)
 
     date_input = input("Enter start date (YYYY-MM-DD): ").strip()
     try:
-        return datetime.strptime(date_input, "%Y-%m-%d"), do_refit
+        start_date = datetime.strptime(date_input, "%Y-%m-%d")
+        return start_date, do_refit
     except ValueError:
         print("Invalid date format. Use YYYY-MM-DD.")
         exit(1)
 
 
+def get_season_date_range(season, year):
+    months = SEASONS[season]
+    
+    if season == "winter":
+        start_date = datetime(year, 11, 1)
+        if (year + 1) % 4 == 0 and ((year + 1) % 100 != 0 or (year + 1) % 400 == 0):
+            end_date = datetime(year + 1, 2, 29)
+        else:
+            end_date = datetime(year + 1, 2, 28)
+    else:
+        start_date = datetime(year, months[0], 1)
+        
+        last_month = months[-1]
+        if last_month == 12:
+            end_date = datetime(year, 12, 31)
+        else:
+            end_date = datetime(year, last_month + 1, 1) - timedelta(days=1)
+    
+    return start_date, end_date
+
+
 def run_dbt_command(command_args):
+    """Execute dbt command and handle errors"""
     try:
         result = subprocess.run(
             ["dbt"] + command_args,
@@ -62,6 +118,7 @@ def run_dbt_command(command_args):
 
 
 def fetch_constants(con, version=None):
+    """Fetch aging constants from database"""
     if version:
         cal_v = version
         cyc_v = version
@@ -105,190 +162,39 @@ def fetch_constants(con, version=None):
     return cal, cyc, cal_v, cyc_v
 
 
-def load_ocv_table(con):
-    df = con.execute("""
-        SELECT ocv_voltage, soc_percent FROM ocv_table ORDER BY ocv_voltage ASC
-    """).df()
-    if df.empty:
-        raise ValueError("OCV table is empty.")
-    return df["ocv_voltage"].to_numpy(), df["soc_percent"].to_numpy()
-
-
-def voltage_to_soc(voltage, ocv_voltages, ocv_socs):
-    return float(np.interp(voltage, ocv_voltages, ocv_socs))
-
-
 def compute_q_loss_calendar(row, A_cal, B, C, D):
+    """Calculate calendar aging q_loss"""
     T = row["avg_temp"] + 273.15
     return float(A_cal * math.exp(B / T) * C * math.exp(D * (row["avg_soc"] / 100)) * (row["total_rest_hours"] ** 0.5))
 
 
 def compute_q_loss_cyclic(row, A, Ea, n, m):
+    """Calculate cyclic aging q_loss"""
     T = row["avg_temp"] + 273.15
-    return float(A * math.exp(-Ea / (8.314 * T)) * (row["avg_c_rate"] ** n) * (row["total_q_throughput"] ** m))
-
-
-def _get_next_capacity_id(con):
-    return con.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM pack_capacity_measurements").fetchone()[0]
+    return float(A * np.exp(-Ea / (8.314 * T)) * (row["avg_c_rate"] ** n) * (row["total_q_throughput"] ** m))
 
 
 def _get_next_qloss_id(con):
+    """Get next available ID for q_loss_history table"""
     return con.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM q_loss_history").fetchone()[0]
 
 
-def get_imbalance_ah(delta_v_mv):
-    return float(np.interp(delta_v_mv, IMBALANCE_TABLE_MV, IMBALANCE_TABLE_AH))
-
-
-def detect_and_estimate_capacity(con, start_date, end_date, ocv_voltages, ocv_socs, model_version):
-    print("\nScanning for charge events...")
-
-    raw_df = con.execute("""
-        SELECT device_id, ts, v_min, current, soc, battery_state, temp01,
-               nominal_capacity,
-               v1, v2, v3, v4, v5, v6, v7, v8,
-               v9, v10, v11, v12, v13, v14, v15, v16,
-               v17, v18, v19, v20, v21, v22, v23, v24
-        FROM inter_battery_variable_mapping
-        WHERE ts >= ?::timestamp
-          AND ts <  ?::timestamp
-        ORDER BY device_id, ts
-    """, [start_date, end_date]).df()
-
-    if raw_df.empty:
-        print("No data in window.")
-        return 0
-
-    cell_cols = [c for c in raw_df.columns if c.startswith("v") and c[1:].isdigit()]
-
-    events_saved = 0
-    next_id = _get_next_capacity_id(con)
-
-    for device_id, group in raw_df.groupby("device_id"):
-        group = group.sort_values("ts").reset_index(drop=True)
-
-        in_charge = False
-        charge_start_idx = None
-
-        for i in range(len(group)):
-            row = group.iloc[i]
-            is_charging = row["current"] >= MIN_CHARGE_CURRENT
-
-            if not in_charge and is_charging and row["soc"] < SOC_START_THRESHOLD:
-                in_charge = True
-                charge_start_idx = i
-
-            elif in_charge:
-                stopped = row["current"] < MIN_CHARGE_CURRENT
-                reached = row["soc"] >= SOC_END_THRESHOLD
-
-                if stopped or reached:
-                    segment = group.iloc[charge_start_idx : i + 1]
-                    actual_start_soc = float(segment.iloc[0]["soc"])
-                    actual_end_soc = float(segment.iloc[-1]["soc"])
-                    soc_rise = actual_end_soc - actual_start_soc
-
-                    if len(segment) < 2 or soc_rise < 10.0:
-                        in_charge = False
-                        continue
-
-                    ts_vals = pd.to_datetime(segment["ts"])
-                    dt_hours = ts_vals.diff().dt.total_seconds().fillna(0) / 3600.0
-                    coulombs_counted = float((segment["current"] * dt_hours).sum())
-
-                    if coulombs_counted <= 0:
-                        in_charge = False
-                        continue
-
-                    nominal_cap = float(segment["nominal_capacity"].iloc[0])
-                    start_soc_frac = actual_start_soc / 100.0
-                    leftover_ah = start_soc_frac * SOH_INITIAL * nominal_cap
-
-                    delta_v_mv = 0.0
-                    # if cell_cols:
-                    #     for _, seg_row in segment.iterrows():
-                    #         cell_voltages = seg_row[cell_cols].dropna().astype(float)
-                    #         if cell_voltages.empty:
-                    #             continue
-                    #         if cell_voltages.max() == VREF_IMBALANCE:
-                    #             delta_v_mv = (cell_voltages.max() - cell_voltages.min()) * 1000.0
-                    #             break
-
-                    if cell_cols:
-                        for _, seg_row in segment.iterrows():
-                            cell_voltages = seg_row[cell_cols].dropna().astype(float)
-                            if cell_voltages.empty:
-                                continue
-                            vmax = cell_voltages.max()
-                            vmin = cell_voltages.min()
-
-                            if vmax == VREF_IMBALANCE:
-                                delta_v_mv = (vmax - vmin) * 1000.0
-                                closest_delta_v = delta_v_mv
-                                break
-
-                            diff = abs(vmax - VREF_IMBALANCE)
-                            if diff < closest_diff:
-                                closest_diff = diff
-                                closest_delta_v = (vmax - vmin) * 1000.0
-
-                        delta_v_mv = closest_delta_v if closest_delta_v is not None else 0.0
-
-                    if delta_v_mv == 0:
-                        in_charge = False
-                        continue
-                    imbalance_ah = get_imbalance_ah(max(0.0, delta_v_mv))
-                    total_q_ah = leftover_ah + coulombs_counted + imbalance_ah
-
-                    avg_temp = float(segment["temp01"].mean())
-                    start_voltage = float(segment.iloc[0]["v_min"])
-                    start_soc_ocv = voltage_to_soc(start_voltage, ocv_voltages, ocv_socs)
-
-                    print(f"device={device_id} date={segment.iloc[0]['ts']} "
-                          f"soc_rise={soc_rise:.1f}% leftover={leftover_ah:.3f}Ah "
-                          f"coulombs={coulombs_counted:.3f}Ah "
-                          f"delta_v={delta_v_mv:.1f}mV imbalance={imbalance_ah:.3f}Ah "
-                          f"total_Q={total_q_ah:.3f}Ah")
-
-                    con.execute("""
-                        INSERT INTO pack_capacity_measurements
-                            (id, device_id, cell_no, event_date,
-                             charge_start_ts, charge_end_ts,
-                             start_voltage, start_soc_ocv, end_soc,
-                             coulombs_counted, remaining_q_ah, total_q_ah,
-                             avg_temp, model_version)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, [
-                        next_id, device_id, 0,
-                        pd.to_datetime(segment.iloc[0]["ts"]).date(),
-                        str(segment.iloc[0]["ts"]),
-                        str(segment.iloc[-1]["ts"]),
-                        start_voltage, start_soc_ocv, actual_end_soc,
-                        coulombs_counted, leftover_ah, total_q_ah,
-                        avg_temp, model_version
-                    ])
-
-                    next_id += 1
-                    events_saved += 1
-                    in_charge = False
-
-    print(f"  {events_saved} event(s) saved.")
-    return events_saved
-
-
-def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_version):
+def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_version, season_year):
+    """Calculate and store q_loss for the given season"""
     print("\nRunning q_loss calculations...")
 
-    cyclic_df = con.execute("""
-        SELECT device_id, cell_no, temp_bucket, c_rate_bucket,
+    # Process cyclic aging
+    cyclic_df = con.execute(f"""
+        SELECT device_id, cell_no, temp_bucket, c_rate_bucket, season_year,
                avg_temp, avg_c_rate, total_q_throughput
         FROM mart_fortnight_cyclic_aging_bucket
+        WHERE season_year = '{season_year}'
     """).df()
 
     if not cyclic_df.empty:
         cyclic_df["q_loss"] = cyclic_df.apply(lambda r: compute_q_loss_cyclic(r, **cyc_constants), axis=1)
         con.register("cyclic_updates_view", cyclic_df)
-        con.execute("""
+        con.execute(f"""
             UPDATE mart_fortnight_cyclic_aging_bucket AS t
             SET q_loss = u.q_loss
             FROM cyclic_updates_view AS u
@@ -296,9 +202,11 @@ def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_
               AND t.cell_no       = u.cell_no
               AND t.temp_bucket   = u.temp_bucket
               AND t.c_rate_bucket = u.c_rate_bucket
+              AND t.season_year   = '{season_year}'
         """)
         con.unregister("cyclic_updates_view")
 
+        # Store in history
         history_cyc = cyclic_df.copy()
         history_cyc["record_date"]      = datetime.today().date()
         history_cyc["aging_type"]       = "cyclic"
@@ -313,18 +221,20 @@ def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_
         ]])
         con.execute("INSERT INTO q_loss_history SELECT * FROM cyc_history_view")
         con.unregister("cyc_history_view")
-        print(f"  Cyclic: {len(cyclic_df)} rows.")
+        print(f"  Cyclic: {len(cyclic_df)} rows processed for {season_year}.")
 
-    cal_df = con.execute("""
-        SELECT device_id, cell_no, soc_bucket, temp_bucket,
+    # Process calendar aging
+    cal_df = con.execute(f"""
+        SELECT device_id, cell_no, soc_bucket, temp_bucket, season_year,
                avg_temp, avg_soc, total_rest_hours
         FROM mart_fortnight_calender_aging_bucket
+        WHERE season_year = '{season_year}'
     """).df()
 
     if not cal_df.empty:
         cal_df["q_loss"] = cal_df.apply(lambda r: compute_q_loss_calendar(r, **cal_constants), axis=1)
         con.register("calendar_updates_view", cal_df)
-        con.execute("""
+        con.execute(f"""
             UPDATE mart_fortnight_calender_aging_bucket AS t
             SET q_loss = u.q_loss
             FROM calendar_updates_view AS u
@@ -332,9 +242,11 @@ def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_
               AND t.cell_no     = u.cell_no
               AND t.soc_bucket  = u.soc_bucket
               AND t.temp_bucket = u.temp_bucket
+              AND t.season_year = '{season_year}'
         """)
         con.unregister("calendar_updates_view")
 
+        # Store in history
         history_cal = cal_df.copy()
         history_cal["record_date"]        = datetime.today().date()
         history_cal["aging_type"]         = "calendar"
@@ -349,10 +261,11 @@ def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_
         ]])
         con.execute("INSERT INTO q_loss_history SELECT * FROM cal_history_view")
         con.unregister("cal_history_view")
-        print(f"  Calendar: {len(cal_df)} rows.")
+        print(f"  Calendar: {len(cal_df)} rows processed for {season_year}.")
 
 
 def _next_version(con, table_type):
+    """Generate next version number for constants"""
     tbl = "aging_constants_cyclic" if table_type == "cyclic" else "aging_constants_calendar"
     rows = con.execute(f"SELECT model_version FROM {tbl}").fetchall()
     nums = []
@@ -365,8 +278,10 @@ def _next_version(con, table_type):
 
 
 def refit_constants(con):
+    """Refit aging constants based on accumulated history"""
     print("\nRefitting constants...")
 
+    # Refit cyclic constants
     cyc_df = con.execute("""
         SELECT avg_temp, avg_c_rate, total_q_throughput, q_loss
         FROM q_loss_history
@@ -395,8 +310,9 @@ def refit_constants(con):
         except Exception as e:
             print(f"  Cyclic refit failed: {e}")
     else:
-        print("  Not enough cyclic history (need ≥4).")
+        print(f"  Not enough cyclic history (need ≥4, have {len(cyc_df)}).")
 
+    # Refit calendar constants
     cal_df = con.execute("""
         SELECT avg_temp, avg_soc, total_rest_hours, q_loss
         FROM q_loss_history
@@ -425,16 +341,17 @@ def refit_constants(con):
         except Exception as e:
             print(f"  Calendar refit failed: {e}")
     else:
-        print("  Not enough calendar history (need ≥4).")
+        print(f"  Not enough calendar history (need ≥4, have {len(cal_df)}).")
 
     print("Refit complete. Next run will automatically pick up the new version.")
 
 
 def main():
     start_date, do_refit = parse_args()
-    end_date = start_date + timedelta(days=NUM_DAYS)
-    db_path  = os.path.join(DBT_PROJECT_DIR, DB_FILE)
+    end_date = datetime.today()
+    db_path = os.path.join(DBT_PROJECT_DIR, DB_FILE)
 
+    # Handle refit mode
     if do_refit:
         con = duckdb.connect(db_path)
         try:
@@ -443,52 +360,81 @@ def main():
             con.close()
         return
 
-    print(f"Processing {NUM_DAYS} days from {start_date.strftime('%Y-%m-%d')}...")
+    # Get all seasons in the date range
+    seasons = get_seasons_in_range(start_date, end_date)
+    
+    print(f"\n{'='*70}")
+    print(f"Processing from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    print(f"{'='*70}")
+    print(f"\nSeasons to process:")
+    for season, year, season_year, s_start, s_end in seasons:
+        days = (s_end - s_start).days + 1
+        print(f"  • {season_year.upper()}: {s_start.strftime('%Y-%m-%d')} → {s_end.strftime('%Y-%m-%d')} ({days} days)")
+    print(f"{'='*70}\n")
 
-    for i in range(NUM_DAYS):
-        date_str = (start_date + timedelta(days=i)).strftime("%Y-%m-%d")
-        print(f"\n--- Day {i + 1}: {date_str} ---")
+    # Process daily data for all days (once)
+    print("STEP 1: Processing daily data for all days...")
+    current_date = start_date
+    day_count = 0
+    
+    while current_date <= end_date:
+        date_str = current_date.strftime("%Y-%m-%d")
+        day_count += 1
+        
+        if day_count % 10 == 0:
+            print(f"  Processed {day_count} days... (current: {date_str})")
+        
         run_dbt_command([
             "run", "--select",
             "stg_battery_raw_parquet_data",
             "inter_battery_variable_mapping",
             "mart_daily_cyclic_aging_bucket",
             "mart_daily_calendar_aging_bucket",
-            "--vars", f'{{"process_date": "{date_str}"}}'
+            "--vars", f'{{"process_date": "{date_str}"}}',
+            "--quiet"
         ])
+        
+        current_date += timedelta(days=1)
+    
+    print(f"  ✓ Completed processing {day_count} days\n")
 
-    print("\nRunning aggregation...")
-    run_dbt_command([
-        "run", "--select",
-        "mart_fortnight_cyclic_aging_bucket",
-        "mart_fortnight_calender_aging_bucket",
-        "--vars",
-        f'{{"start_date": "{start_date.strftime("%Y-%m-%d")}", '
-        f'"end_date": "{end_date.strftime("%Y-%m-%d")}", '
-        f'"process_date": "{start_date.strftime("%Y-%m-%d")}"}}'
-    ])
-
+    # Process each season separately
+    print("STEP 2: Aggregating data by season...")
     con = duckdb.connect(db_path)
+    
     try:
         cal_constants, cyc_constants, cal_v, cyc_v = fetch_constants(con)
-        ocv_voltages, ocv_socs = load_ocv_table(con)
-        run_q_loss_calculations(con, cal_constants, cyc_constants, cal_v, cyc_v)
-        events = detect_and_estimate_capacity(
-            con,
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
-            ocv_voltages, ocv_socs,
-            cal_v
-        )
-        if events == 0:
-            print("No charge events detected.")
+        
+        for season, year, season_year, s_start, s_end in seasons:
+            print(f"\n  Processing {season_year.upper()}...")
+            
+            # Run seasonal aggregation for this specific season
+            run_dbt_command([
+                "run", "--select",
+                "mart_fortnight_cyclic_aging_bucket",
+                "mart_fortnight_calender_aging_bucket",
+                "--vars",
+                f'{{"start_date": "{s_start.strftime("%Y-%m-%d")}", '
+                f'"end_date": "{(s_end + timedelta(days=1)).strftime("%Y-%m-%d")}", '
+                f'"process_date": "{s_start.strftime("%Y-%m-%d")}"}}',
+                "--quiet"
+            ])
+            
+            # Calculate q_loss for this season
+            run_q_loss_calculations(con, cal_constants, cyc_constants, cal_v, cyc_v, season_year)
+            print(f"  ✓ {season_year} complete")
+        
     except BaseException as e:
         print(f"Error: {type(e).__name__}: {e}")
         traceback.print_exc()
     finally:
         con.close()
 
-    print("\nDone.")
+    print(f"\n{'='*70}")
+    print(f"✓ ALL PROCESSING COMPLETE")
+    print(f"  Total days processed: {day_count}")
+    print(f"  Seasons aggregated: {len(seasons)}")
+    print(f"{'='*70}\n")
 
 
 if __name__ == "__main__":

@@ -92,22 +92,22 @@ bucketed AS (
             ELSE 'out_of_range'
         END AS temp_bucket,
 
-        -- Extract year from timestamp
-        EXTRACT(YEAR FROM ts) AS year,
-
-        -- Determine season based on month
         CASE
             WHEN EXTRACT(MONTH FROM ts) IN (3, 4, 5, 6) THEN 'summer'
             WHEN EXTRACT(MONTH FROM ts) IN (7, 8, 9, 10) THEN 'rainy'
             WHEN EXTRACT(MONTH FROM ts) IN (11, 12, 1, 2) THEN 'winter'
         END AS season,
 
-        -- Create season_year column (for winter, Nov-Dec belong to next year's winter)
+        CASE
+            WHEN EXTRACT(MONTH FROM ts) IN (1, 2) THEN EXTRACT(YEAR FROM ts) - 1
+            ELSE EXTRACT(YEAR FROM ts)
+        END AS year,
+
         CASE
             WHEN EXTRACT(MONTH FROM ts) IN (3, 4, 5, 6) THEN 'summer_' || EXTRACT(YEAR FROM ts)
             WHEN EXTRACT(MONTH FROM ts) IN (7, 8, 9, 10) THEN 'rainy_' || EXTRACT(YEAR FROM ts)
-            WHEN EXTRACT(MONTH FROM ts) IN (1, 2) THEN 'winter_' || EXTRACT(YEAR FROM ts)
-            WHEN EXTRACT(MONTH FROM ts) IN (11, 12) THEN 'winter_' || (EXTRACT(YEAR FROM ts) + 1)
+            WHEN EXTRACT(MONTH FROM ts) IN (11, 12) THEN 'winter_' || EXTRACT(YEAR FROM ts)
+            WHEN EXTRACT(MONTH FROM ts) IN (1, 2) THEN 'winter_' || (EXTRACT(YEAR FROM ts) - 1)
         END AS season_year
 
     FROM unpivoted

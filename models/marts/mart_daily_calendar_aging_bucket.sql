@@ -86,8 +86,28 @@ bucketed AS (
             WHEN temp_c BETWEEN 45 AND 50 THEN '45 to 50'
             WHEN temp_c BETWEEN 50 AND 55 THEN '50 to 55'
             ELSE 'out_of_range'
-        END AS temp_bucket
+        END AS temp_bucket,
+        
+        CASE
+            WHEN EXTRACT(MONTH FROM ts) IN (3, 4, 5, 6) THEN 'summer'
+            WHEN EXTRACT(MONTH FROM ts) IN (7, 8, 9, 10) THEN 'rainy'
+            WHEN EXTRACT(MONTH FROM ts) IN (11, 12, 1, 2) THEN 'winter'
+        END AS season,
+
+        CASE
+            WHEN EXTRACT(MONTH FROM ts) IN (1, 2) THEN EXTRACT(YEAR FROM ts) - 1
+            ELSE EXTRACT(YEAR FROM ts)
+        END AS year,
+
+        CASE
+            WHEN EXTRACT(MONTH FROM ts) IN (3, 4, 5, 6) THEN 'summer_' || EXTRACT(YEAR FROM ts)
+            WHEN EXTRACT(MONTH FROM ts) IN (7, 8, 9, 10) THEN 'rainy_' || EXTRACT(YEAR FROM ts)
+            WHEN EXTRACT(MONTH FROM ts) IN (11, 12) THEN 'winter_' || EXTRACT(YEAR FROM ts)
+            WHEN EXTRACT(MONTH FROM ts) IN (1, 2) THEN 'winter_' || (EXTRACT(YEAR FROM ts) - 1)
+        END AS season_year
+
     FROM unpivoted
+    WHERE temp_c BETWEEN -10 AND 55
 )
 
 SELECT *
