@@ -99,7 +99,6 @@ def get_season_date_range(season, year):
 
 
 def run_dbt_command(command_args):
-    """Execute dbt command and handle errors"""
     try:
         result = subprocess.run(
             ["dbt"] + command_args,
@@ -118,7 +117,6 @@ def run_dbt_command(command_args):
 
 
 def fetch_constants(con, version=None):
-    """Fetch aging constants from database"""
     if version:
         cal_v = version
         cyc_v = version
@@ -163,27 +161,22 @@ def fetch_constants(con, version=None):
 
 
 def compute_q_loss_calendar(row, A_cal, B, C, D):
-    """Calculate calendar aging q_loss"""
     T = row["avg_temp"] + 273.15
     return float(A_cal * math.exp(B / T) * C * math.exp(D * (row["avg_soc"] / 100)) * (row["total_rest_hours"] ** 0.5))
 
 
 def compute_q_loss_cyclic(row, A, Ea, n, m):
-    """Calculate cyclic aging q_loss"""
     T = row["avg_temp"] + 273.15
     return float(A * np.exp(-Ea / (8.314 * T)) * (row["avg_c_rate"] ** n) * (row["total_q_throughput"] ** m))
 
 
 def _get_next_qloss_id(con):
-    """Get next available ID for q_loss_history table"""
     return con.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM q_loss_history").fetchone()[0]
 
 
 def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_version, season_year):
-    """Calculate and store q_loss for the given season"""
     print("\nRunning q_loss calculations...")
 
-    # Process cyclic aging
     cyclic_df = con.execute(f"""
         SELECT device_id, cell_no, temp_bucket, c_rate_bucket, season_year,
                avg_temp, avg_c_rate, total_q_throughput
@@ -206,7 +199,6 @@ def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_
         """)
         con.unregister("cyclic_updates_view")
 
-        # Store in history
         history_cyc = cyclic_df.copy()
         history_cyc["record_date"]      = datetime.today().date()
         history_cyc["aging_type"]       = "cyclic"
@@ -223,7 +215,6 @@ def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_
         con.unregister("cyc_history_view")
         print(f"  Cyclic: {len(cyclic_df)} rows processed for {season_year}.")
 
-    # Process calendar aging
     cal_df = con.execute(f"""
         SELECT device_id, cell_no, soc_bucket, temp_bucket, season_year,
                avg_temp, avg_soc, total_rest_hours
@@ -246,7 +237,6 @@ def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_
         """)
         con.unregister("calendar_updates_view")
 
-        # Store in history
         history_cal = cal_df.copy()
         history_cal["record_date"]        = datetime.today().date()
         history_cal["aging_type"]         = "calendar"
@@ -265,7 +255,6 @@ def run_q_loss_calculations(con, cal_constants, cyc_constants, cal_version, cyc_
 
 
 def _next_version(con, table_type):
-    """Generate next version number for constants"""
     tbl = "aging_constants_cyclic" if table_type == "cyclic" else "aging_constants_calendar"
     rows = con.execute(f"SELECT model_version FROM {tbl}").fetchall()
     nums = []
@@ -278,10 +267,8 @@ def _next_version(con, table_type):
 
 
 def refit_constants(con):
-    """Refit aging constants based on accumulated history"""
     print("\nRefitting constants...")
 
-    # Refit cyclic constants
     cyc_df = con.execute("""
         SELECT avg_temp, avg_c_rate, total_q_throughput, q_loss
         FROM q_loss_history
@@ -312,7 +299,6 @@ def refit_constants(con):
     else:
         print(f"  Not enough cyclic history (need ≥4, have {len(cyc_df)}).")
 
-    # Refit calendar constants
     cal_df = con.execute("""
         SELECT avg_temp, avg_soc, total_rest_hours, q_loss
         FROM q_loss_history
@@ -351,7 +337,6 @@ def main():
     end_date = datetime.today()
     db_path = os.path.join(DBT_PROJECT_DIR, DB_FILE)
 
-    # Handle refit mode
     if do_refit:
         con = duckdb.connect(db_path)
         try:
@@ -360,7 +345,6 @@ def main():
             con.close()
         return
 
-    # Get all seasons in the date range
     seasons = get_seasons_in_range(start_date, end_date)
     
     print(f"\n{'='*70}")
@@ -369,10 +353,9 @@ def main():
     print(f"\nSeasons to process:")
     for season, year, season_year, s_start, s_end in seasons:
         days = (s_end - s_start).days + 1
-        print(f"  • {season_year.upper()}: {s_start.strftime('%Y-%m-%d')} → {s_end.strftime('%Y-%m-%d')} ({days} days)")
+        print(f"  • {season_year.upper()}: {s_start.strftime('%Y-%m-%d')} -> {s_end.strftime('%Y-%m-%d')} ({days} days)")
     print(f"{'='*70}\n")
 
-    # Process daily data for all days (once)
     print("STEP 1: Processing daily data for all days...")
     current_date = start_date
     day_count = 0
@@ -396,9 +379,8 @@ def main():
         
         current_date += timedelta(days=1)
     
-    print(f"  ✓ Completed processing {day_count} days\n")
+    print(f"  Completed processing {day_count} days\n")
 
-    # Process each season separately
     print("STEP 2: Aggregating data by season...")
     con = duckdb.connect(db_path)
     
@@ -408,7 +390,6 @@ def main():
         for season, year, season_year, s_start, s_end in seasons:
             print(f"\n  Processing {season_year.upper()}...")
             
-            # Run seasonal aggregation for this specific season
             run_dbt_command([
                 "run", "--select",
                 "mart_fortnight_cyclic_aging_bucket",
@@ -420,9 +401,8 @@ def main():
                 "--quiet"
             ])
             
-            # Calculate q_loss for this season
             run_q_loss_calculations(con, cal_constants, cyc_constants, cal_v, cyc_v, season_year)
-            print(f"  ✓ {season_year} complete")
+            print(f"  {season_year} complete")
         
     except BaseException as e:
         print(f"Error: {type(e).__name__}: {e}")
@@ -431,7 +411,7 @@ def main():
         con.close()
 
     print(f"\n{'='*70}")
-    print(f"✓ ALL PROCESSING COMPLETE")
+    print(f" ALL PROCESSING COMPLETE")
     print(f"  Total days processed: {day_count}")
     print(f"  Seasons aggregated: {len(seasons)}")
     print(f"{'='*70}\n")
