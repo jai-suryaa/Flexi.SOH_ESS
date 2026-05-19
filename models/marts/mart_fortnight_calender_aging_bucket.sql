@@ -8,8 +8,12 @@ WITH idle_periods_unpivoted AS (
     SELECT *
     FROM {{ ref('mart_daily_calendar_aging_bucket') }}
     {% if is_incremental() %}
-        WHERE ts >= '{{ var("start_date") }}'::date
-          AND ts <  '{{ var("end_date") }}'::date
+        WHERE season_year IN (
+            SELECT DISTINCT season_year
+            FROM {{ ref('mart_daily_calendar_aging_bucket') }}
+            WHERE ts >= '{{ var("start_date") }}'::date
+              AND ts <  '{{ var("end_date") }}'::date
+        )
     {% endif %}
 ),
 
@@ -21,6 +25,14 @@ all_events_with_duration AS (
             LEAD(ts, 1) OVER (PARTITION BY device_id ORDER BY ts) - ts
         )) AS duration_seconds
     FROM {{ ref('inter_battery_variable_mapping') }}
+    {% if is_incremental() %}
+        WHERE season_year IN (
+            SELECT DISTINCT season_year
+            FROM {{ ref('mart_daily_calendar_aging_bucket') }}
+            WHERE ts >= '{{ var("start_date") }}'::date
+              AND ts <  '{{ var("end_date") }}'::date
+        )
+    {% endif %}
 ),
 
 idle_with_duration AS (

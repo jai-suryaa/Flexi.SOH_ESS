@@ -8,8 +8,12 @@ WITH buckets AS (
     SELECT *
     FROM {{ ref('mart_daily_cyclic_aging_bucket') }}
     {% if is_incremental() %}
-        WHERE ts >= '{{ var("start_date") }}'::date
-          AND ts <  '{{ var("end_date") }}'::date
+        WHERE season_year IN (
+            SELECT DISTINCT season_year
+            FROM {{ ref('mart_daily_cyclic_aging_bucket') }}
+            WHERE ts >= '{{ var("start_date") }}'::date
+              AND ts <  '{{ var("end_date") }}'::date
+        )
     {% endif %}
 ),
 

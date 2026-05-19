@@ -49,7 +49,7 @@ WITH source_data AS (
         TRY_CAST(Temp14 AS DOUBLE) AS temp16
 
     FROM {{ ref('stg_battery_raw_parquet_data') }}
-    WHERE batteryId IN ('2233786558040370260', '4107284003026496596', '1585268215994051668')
+    WHERE batteryId IN ('2233786558040370260', '4107284003026496596', '1585268215994051668', '2305844156373396564', '2305844156373331028', '5260205507633474644', '432346707091975252', '3458765660980178004', '1729383404069907540')
 ),
 
 with_avg_temp AS (
@@ -81,8 +81,9 @@ q_throughput_calc AS (
     SELECT
         *,
         TRY_CAST(SUM(q_delta) OVER (
-            PARTITION BY device_id, DATE_TRUNC('day', ts)
+            PARTITION BY device_id
             ORDER BY ts
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
         ) AS DOUBLE) AS q_throughput
     FROM q_calc
 )

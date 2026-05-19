@@ -9,7 +9,7 @@ import os
 import traceback
 from scipy.optimize import curve_fit
 
-DBT_PROJECT_DIR = "C:/EOL/SOH/Flexi.SOH_ESS"
+DBT_PROJECT_DIR = "C:/Jai/Flexi.SOH_ESS"
 DB_FILE = "dev.duckdb"
 
 SEASONS = {
@@ -373,8 +373,7 @@ def main():
             "inter_battery_variable_mapping",
             "mart_daily_cyclic_aging_bucket",
             "mart_daily_calendar_aging_bucket",
-            "--vars", f'{{"process_date": "{date_str}"}}',
-            "--quiet"
+            "--vars", f'{{"process_date": "{date_str}"}}'
         ])
         
         current_date += timedelta(days=1)
@@ -397,8 +396,7 @@ def main():
                 "--vars",
                 f'{{"start_date": "{s_start.strftime("%Y-%m-%d")}", '
                 f'"end_date": "{(s_end + timedelta(days=1)).strftime("%Y-%m-%d")}", '
-                f'"process_date": "{s_start.strftime("%Y-%m-%d")}"}}',
-                "--quiet"
+                f'"process_date": "{s_start.strftime("%Y-%m-%d")}"}}'
             ])
             
             run_q_loss_calculations(con, cal_constants, cyc_constants, cal_v, cyc_v, season_year)

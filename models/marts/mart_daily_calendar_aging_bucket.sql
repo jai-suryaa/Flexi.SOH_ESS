@@ -30,7 +30,6 @@ unpivoted AS (
         f.soc,
         f.current,
         f.battery_state,
-        f.v_min,
         t.value.cell_no AS cell_no,
         t.value.temp_c AS temp_c
     FROM filtered f
